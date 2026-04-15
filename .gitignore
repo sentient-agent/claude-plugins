@@ -1,0 +1,7 @@
+.env
+.env.*
+.DS_Store
+node_modules/
+*.pid
+channels/*/inbox/
+channels/*/approved/

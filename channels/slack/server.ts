@@ -38,6 +38,17 @@ try {
   }
 } catch {}
 
+// Also load plugin root .env (CWD) for config like SLACK_ADMIN_USER_ID.
+try {
+  const pluginEnv = join(process.cwd(), '.env')
+  if (pluginEnv !== ENV_FILE) {
+    for (const line of readFileSync(pluginEnv, 'utf8').split('\n')) {
+      const m = line.match(/^(\w+)=(.*)$/)
+      if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+    }
+  }
+} catch {}
+
 const BOT_TOKEN = process.env.SLACK_BOT_TOKEN
 const APP_TOKEN = process.env.SLACK_APP_TOKEN
 const STATIC = process.env.SLACK_ACCESS_MODE === 'static'
@@ -115,10 +126,15 @@ type Access = {
   chunkMode?: 'length' | 'newline'
 }
 
+// Bootstrap admin user from env so it doesn't need to be in access.json.
+const ADMIN_USER_IDS: string[] = process.env.SLACK_ADMIN_USER_ID
+  ? process.env.SLACK_ADMIN_USER_ID.split(',').map(s => s.trim()).filter(Boolean)
+  : []
+
 function defaultAccess(): Access {
   return {
     dmPolicy: 'pairing',
-    allowFrom: [],
+    allowFrom: [...ADMIN_USER_IDS],
     channels: {},
     pending: {},
   }
@@ -143,9 +159,14 @@ function readAccessFile(): Access {
   try {
     const raw = readFileSync(ACCESS_FILE, 'utf8')
     const parsed = JSON.parse(raw) as Partial<Access>
+    const allowFrom = parsed.allowFrom ?? []
+    // Always include admin user IDs from env
+    for (const id of ADMIN_USER_IDS) {
+      if (!allowFrom.includes(id)) allowFrom.push(id)
+    }
     return {
       dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
+      allowFrom,
       channels: parsed.channels ?? {},
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
@@ -432,6 +453,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['url'],
       },
     },
+    {
+      name: 'read_history',
+      description: 'Read recent message history from a Slack channel. Returns messages in chronological order with usernames and timestamps.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Channel ID to read history from' },
+          limit: { type: 'number', description: 'Number of messages to fetch (default 20, max 100)' },
+        },
+        required: ['chat_id'],
+      },
+    },
   ],
 }))
 
@@ -520,6 +553,50 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         mkdirSync(INBOX_DIR, { recursive: true })
         writeFileSync(path, buf)
         return { content: [{ type: 'text', text: path }] }
+      }
+      case 'read_history': {
+        const chat_id = args.chat_id as string
+        const limit = Math.max(1, Math.min((args.limit as number) ?? 20, 100))
+
+        assertAllowedChat(chat_id)
+
+        const result = await slack.conversations.history({
+          channel: chat_id,
+          limit,
+        })
+
+        if (!result.messages || result.messages.length === 0) {
+          return { content: [{ type: 'text', text: 'no messages found' }] }
+        }
+
+        // Resolve user IDs to names (with simple cache)
+        const userCache = new Map<string, string>()
+        async function resolveUser(uid: string): Promise<string> {
+          if (userCache.has(uid)) return userCache.get(uid)!
+          try {
+            const info = await slack.users.info({ user: uid })
+            const name = info.user?.name ?? info.user?.real_name ?? uid
+            userCache.set(uid, name)
+            return name
+          } catch {
+            userCache.set(uid, uid)
+            return uid
+          }
+        }
+
+        // Messages come newest-first from Slack, reverse for chronological order
+        const messages = result.messages.reverse()
+        const lines: string[] = []
+
+        for (const msg of messages) {
+          if (!msg.ts) continue
+          const user = msg.user ? await resolveUser(msg.user) : msg.bot_id ?? 'unknown'
+          const time = new Date(parseFloat(msg.ts) * 1000).toISOString()
+          const text = (msg.text ?? '').replace(/<@(\w+)>/g, (_, uid) => `@${uid}`)
+          lines.push(`[${time}] ${user}: ${text}`)
+        }
+
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
       }
       default:
         return {
