@@ -780,9 +780,12 @@ async function handleMessage(
 socketMode.on('message', async ({ event, ack }) => {
   await ack()
 
-  if (!event || event.subtype) return // Skip bot messages, edits, etc.
+  if (!event) return
+  // Allow file uploads and thread broadcasts through; skip bot messages, edits, joins, etc.
+  const ALLOWED_SUBTYPES = new Set(['file_share', 'file_comment', 'thread_broadcast', 'bot_message'])
+  if (event.subtype && !ALLOWED_SUBTYPES.has(event.subtype)) return
 
-  const userId = event.user as string
+  const userId = (event.user ?? event.bot_id ?? '') as string
   const channelId = event.channel as string
   const channelType = event.channel_type as string
   const text = (event.text as string) ?? ''
