@@ -327,6 +327,60 @@ function checkApprovals(): void {
 
 if (!STATIC) setInterval(checkApprovals, 5000).unref()
 
+/**
+ * Extracts readable text from a Slack message's Block Kit attachments/blocks.
+ * Used when `msg.text` is empty (common for rich Block Kit messages).
+ * Walks `attachments[].blocks[]` and the top-level `blocks[]`, pulling text
+ * from section/header/context blocks and their fields/elements.
+ */
+function extractBlockKitText(msg: Record<string, unknown>): string {
+  const parts: string[] = []
+
+  const walkBlocks = (blocks: unknown): void => {
+    if (!Array.isArray(blocks)) return
+    for (const block of blocks) {
+      if (!block || typeof block !== 'object') continue
+      const b = block as Record<string, unknown>
+
+      // section / header blocks have a `text` object with a `text` field
+      const t = b.text as { text?: string } | undefined
+      if (t?.text) parts.push(t.text)
+
+      // section blocks may also have a `fields` array of text objects
+      const fields = b.fields as Array<{ text?: string }> | undefined
+      if (Array.isArray(fields)) {
+        for (const f of fields) {
+          if (f?.text) parts.push(f.text)
+        }
+      }
+
+      // context blocks have `elements[]` with text objects
+      const elements = b.elements as Array<{ text?: string; type?: string }> | undefined
+      if (Array.isArray(elements)) {
+        for (const el of elements) {
+          if (el?.text) parts.push(el.text)
+        }
+      }
+    }
+  }
+
+  // Top-level blocks (rare but possible)
+  walkBlocks(msg.blocks)
+
+  // Attachments — each can have its own `text` fallback + `blocks[]`
+  const attachments = msg.attachments as Array<Record<string, unknown>> | undefined
+  if (Array.isArray(attachments)) {
+    for (const att of attachments) {
+      if (typeof att.text === 'string' && att.text) parts.push(att.text)
+      if (typeof att.title === 'string' && att.title) parts.push(att.title)
+      if (typeof att.pretext === 'string' && att.pretext) parts.push(att.pretext)
+      walkBlocks(att.blocks)
+    }
+  }
+
+  return parts.join(' | ').replace(/<@(\w+)>/g, (_, uid) => `@${uid}`)
+}
+
 function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
   if (text.length <= limit) return [text]
   const out: string[] = []
@@ -619,7 +673,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (!msg.ts) continue
           const user = msg.user ? await resolveUser(msg.user) : msg.bot_id ?? 'unknown'
           const time = new Date(parseFloat(msg.ts) * 1000).toISOString()
-          const text = (msg.text ?? '').replace(/<@(\w+)>/g, (_, uid) => `@${uid}`)
+          let text = (msg.text ?? '').replace(/<@(\w+)>/g, (_, uid) => `@${uid}`)
+
+          // If msg.text is empty, extract readable text from Block Kit attachments/blocks
+          if (!text.trim()) {
+            const extracted = extractBlockKitText(msg)
+            if (extracted) text = extracted
+          }
+
           lines.push(`[${time}] ${user}: ${text}`)
         }
 
